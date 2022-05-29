@@ -1,0 +1,104 @@
+image: mcr.microsoft.com/dotnet/sdk:5.0
+
+stages:
+  - build
+  - test
+  - publish
+
+# stage: build ----------------------
+
+build:
+  stage: build
+  parallel:
+    matrix:
+      - CONFIGURATION:
+          - Debug
+          - Release
+  script:
+    - dotnet build --configuration $CONFIGURATION
+  artifacts:
+    paths:
+      - DeepL/bin/
+      - DeepL/obj/
+      - DeepLTests/bin/
+      - DeepLTests/obj/
+
+package:
+  stage: build
+  needs: ["build"]
+  script:
+    - dotnet pack --no-restore --configuration Release -o package/Release
+  artifacts:
+    paths:
+      - package/
+
+# stage: test -------------------------
+
+.test-server-secrets-template: &test_server_secrets_template
+  secrets:
+    DEEPL_AUTH_KEY:
+      vault: jenkins/client_libraries/test_auth_key@backend
+      file: false
+    DEEPL_SERVER_URL:
+      vault: jenkins/client_libraries/test_server_url@backend
+      file: false
+
+test:
+  <<: *test_server_secrets_template
+  stage: test
+  dependencies:
+    - build
+  services:
+    - name: $DOCKER_REGISTRY/deepl/deepl-mock
+      alias: deepl-mock
+  parallel:
+    matrix:
+      - DOCKER_IMAGE: "mcr.microsoft.com/dotnet/sdk:5.0"
+        FRAMEWORK: "net5.0"
+        CONFIGURATION: "Release"
+      - DOCKER_IMAGE: "mcr.microsoft.com/dotnet/sdk:3.1"
+        FRAMEWORK: "netcoreapp3.1"
+        CONFIGURATION:
+          - Debug
+          - Release
+        USE_MOCK_SERVER: "use mock server"
+      - DOCKER_IMAGE: "mcr.microsoft.com/dotnet/sdk:5.0"
+        FRAMEWORK: "net5.0"
+        CONFIGURATION:
+          - Debug
+          - Release
+        USE_MOCK_SERVER: "use mock server"
+  image: ${DOCKER_IMAGE}
+  script:
+    - >
+      if [[ ! -z "${USE_MOCK_SERVER}" ]]; then
+        echo "Using mock server"
+        export DEEPL_SERVER_URL=http://deepl-mock:3000
+        export DEEPL_MOCK_SERVER_PORT=3000
+        export DEEPL_PROXY_URL=http://deepl-mock:3001
+        export DEEPL_MOCK_PROXY_SERVER_PORT=3001
+      fi
+    - dotnet test
+      --configuration $CONFIGURATION
+      --framework $FRAMEWORK
+      --logger:"junit;LogFilePath=..\artifacts\{assembly}-test-result.xml;MethodFormat=Class;FailureBodyFormat=Verbose"
+  artifacts:
+    reports:
+      junit:
+        - artifacts/*test-result.xml
+
+# stage: publish -------------------------
+
+nuget upload:
+  stage: publish
+  dependencies:
+    - package
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+  script:
+    - dotnet nuget push package/Release/DeepL.net.*.nupkg --api-key $NUGET_API_KEY
+      --source https://api.nuget.org/v3/index.json --timeout 30
+  secrets:
+    NUGET_API_KEY:
+      vault: jenkins/client_libraries/nuget_api_key@backend
+      file: false
